@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 SecureChat Server
 
@@ -15,6 +14,7 @@ Stack:
   • In-memory rate limiting per IP / user
 """
 
+# Raad -> # Commnts
 import os
 import sys
 import json
