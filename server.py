@@ -62,7 +62,6 @@ def options_handler(path=""):
 def serve_index():
     return send_from_directory("static", "index.html")
 
-
 # ── Rate limiting (in-memory, per key) ───────────────────────────────────────
 _rl: dict = {}
 _rl_lock = threading.Lock()
