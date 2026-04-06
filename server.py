@@ -1,665 +1,439 @@
-"""
-SecureChat Server
-
-Threat model: Honest-But-Curious (HbC) — server follows protocol but may
-inspect all data it holds. The server never has access to plaintext messages
-or private keys.
-
-Stack:
-  • Flask + threaded WSGI
-  • SQLite (WAL mode for concurrent reads)
-  • PBKDF2-SHA256 (260 000 iterations) password hashing  [no argon2 available]
-  • HS256 JWT session tokens (stdlib HMAC)
-  • TOTP RFC 6238 second factor
-  • In-memory rate limiting per IP / user
-"""
-
-# Raad -> # Commnts
-import os
-import sys
-import json
-import time
-import uuid
-import hmac
-import base64
-import hashlib
-import struct
-import sqlite3
-import threading
-
+import os, re, time, threading, secrets
 from functools import wraps
-from flask import Flask, request, jsonify, g, send_from_directory
 
-import crypto_utils as C
+import pyotp
+from flask import Flask, request, jsonify, g
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_sqlalchemy import SQLAlchemy
+import jwt          # PyJWT for JWT handling
+import hashlib
 
-# Configuration
-DB_PATH          = os.environ.get("SC_DB",     "server.db")
-JWT_SECRET       = os.environ.get("SC_SECRET", os.urandom(32).hex())
-PORT             = int(os.environ.get("SC_PORT", 5000))
-TOKEN_TTL        = 86_400          # 24 h
-MSG_MAX_AGE      = 7 * 86_400      # 7 days hard cap for offline queue
-CLEANUP_INTERVAL = 300             # 5 min background cleanup
+# 1. App & extensions
+app = Flask(__name__)
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL", "sqlite:///securechat.db")
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["JWT_SECRET"] = os.getenv("JWT_SECRET", secrets.token_hex(32))
+app.config["JWT_EXPIRY_SECONDS"] = int(os.getenv("JWT_EXPIRY_SECONDS", 3600))
 
-app = Flask(__name__, static_folder="static", static_url_path="/static")
-app.config["JSON_SORT_KEYS"] = False
+# (R21) Offline-queue limits
+MAX_QUEUE_SIZE = 200          # messages per user
+MAX_QUEUE_AGE_DAYS = 30       # hard ceiling even if TTL not expired
+MAX_MESSAGE_BYTES = 10 * 1024 # 10 KB ciphertext cap (DoS protection, R22)
 
+db = SQLAlchemy(app)
 
-# CORS (allows browser clients on same origin or dev ports) 
-@app.after_request
-def add_cors(response):
-    response.headers["Access-Control-Allow-Origin"]  = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
-    return response
-
-@app.route("/", defaults={"path": ""}, methods=["OPTIONS"])
-@app.route("/<path:path>", methods=["OPTIONS"])
-def options_handler(path=""):
-    return "", 204
-
-# ── Serve the browser client ──────────────────────────────────────────────────
-@app.route("/")
-def serve_index():
-    return send_from_directory("static", "index.html")
-
-# ── Rate limiting (in-memory, per key) ───────────────────────────────────────
-_rl: dict = {}
-_rl_lock = threading.Lock()
-
-# 4. Rate limit
-def rate_ok(key: str, limit: int, window: int) -> bool:
-    now = time.time()
-    with _rl_lock:
-        bucket = [t for t in _rl.get(key, []) if now - t < window]
-        if len(bucket) >= limit:
-            _rl[key] = bucket
-            return False
-        bucket.append(now)
-        _rl[key] = bucket
-        return True
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=[],          # only apply per-route limits
+    storage_uri="memory://",
+)
 
 
-# JWT (HS256, stdlib) 
-def _b64u(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
-
-def _unb64u(s: str) -> bytes:
-    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
-
-# 3. JWT Authentication with HS256 signatures.
-def jwt_create(user_id: int) -> str:
-    header  = _b64u(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-    payload = _b64u(json.dumps({
-        "sub": user_id,
-        "exp": int(time.time()) + TOKEN_TTL,
-        "jti": uuid.uuid4().hex,
-    }).encode())
-    sig = _b64u(hmac.new(
-        JWT_SECRET.encode(), f"{header}.{payload}".encode(), hashlib.sha256
-    ).digest())
-    return f"{header}.{payload}.{sig}"
-
-def jwt_verify(token: str):
-    try:
-        h, p, s = token.split(".")
-        expected = _b64u(hmac.new(
-            JWT_SECRET.encode(), f"{h}.{p}".encode(), hashlib.sha256
-        ).digest())
-        if not hmac.compare_digest(s, expected):
-            return None
-        payload = json.loads(_unb64u(p))
-        if payload.get("exp", 0) < time.time():
-            return None
-        return payload
-    except Exception:
-        return None
+# 2. Database models
+class User(db.Model):
+    __tablename__ = "users"
+    username   = db.Column(db.String(64), primary_key=True)
+    pw_hash    = db.Column(db.LargeBinary, nullable=False)
+    salt       = db.Column(db.LargeBinary, nullable=False)
+    otp_secret = db.Column(db.String(64),  nullable=False)
+    pub_key    = db.Column(db.Text,        nullable=False)
 
 
-# 2. Password hashing (PBKDF2-SHA256, 260k iterations) 
-def hash_password(pw: str) -> str:
-    salt = os.urandom(16)
-    key  = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, 260_000)
-    return f"{salt.hex()}:{key.hex()}"
-
-def check_password(stored: str, pw: str) -> bool:
-    try:
-        salt_h, key_h = stored.split(":")
-        key = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt_h), 260_000)
-        return hmac.compare_digest(key.hex(), key_h)
-    except Exception:
-        return False
+class FriendRequest(db.Model):
+    __tablename__ = "friend_requests"
+    id       = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    sender   = db.Column(db.String(64), nullable=False)
+    receiver = db.Column(db.String(64), nullable=False)
+    db.UniqueConstraint("sender", "receiver")
 
 
-# ── Database ──────────────────────────────────────────────────────────────────
-def get_db() -> sqlite3.Connection:
-    if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH, timeout=30)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA journal_mode=WAL")
-        g.db.execute("PRAGMA foreign_keys=ON")
-    return g.db
-
-@app.teardown_appcontext
-def close_db(_=None):
-    db = g.pop("db", None)
-    if db:
-        db.close()
-
-# 1. SQLite schema & WAL init //users,messages (offline queue), delivery_receipts, friend_requests, blocked, active_tokens
-def init_db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.executescript("""
-        PRAGMA journal_mode=WAL;
-        PRAGMA foreign_keys=ON;
-
-        CREATE TABLE IF NOT EXISTS users (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            username    TEXT    UNIQUE NOT NULL,
-            pw_hash     TEXT    NOT NULL,
-            totp_secret TEXT    NOT NULL,
-            sign_pub    TEXT    NOT NULL,   -- Ed25519 identity signing pubkey (hex)
-            ik_pub      TEXT    NOT NULL,   -- X25519 identity DH pubkey (hex)
-            spk_pub     TEXT    NOT NULL,   -- X25519 signed prekey pubkey (hex)
-            spk_sig     TEXT    NOT NULL,   -- Ed25519 sig of spk_pub (hex)
-            created_at  REAL    DEFAULT (unixepoch())
-        );
-
-        CREATE TABLE IF NOT EXISTS active_tokens (
-            token      TEXT PRIMARY KEY,
-            user_id    INTEGER NOT NULL,
-            expires_at REAL    NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS friend_requests (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            sender_id   INTEGER NOT NULL,
-            receiver_id INTEGER NOT NULL,
-            status      TEXT    DEFAULT 'pending',   -- pending | accepted | declined
-            created_at  REAL    DEFAULT (unixepoch()),
-            UNIQUE(sender_id, receiver_id),
-            FOREIGN KEY (sender_id)   REFERENCES users(id),
-            FOREIGN KEY (receiver_id) REFERENCES users(id)
-        );
-
-        -- Offline ciphertext queue (store-and-forward, R20)
-        CREATE TABLE IF NOT EXISTS messages (
-            id          TEXT    PRIMARY KEY,
-            sender_id   INTEGER NOT NULL,
-            receiver_id INTEGER NOT NULL,
-            payload     TEXT    NOT NULL,   -- JSON envelope (ciphertext only)
-            expires_at  REAL,               -- NULL = no TTL
-            created_at  REAL    DEFAULT (unixepoch()),
-            FOREIGN KEY (sender_id)   REFERENCES users(id),
-            FOREIGN KEY (receiver_id) REFERENCES users(id)
-        );
-
-        -- Delivery receipts: sender polls these to learn "delivered" status (R17-R18)
-        CREATE TABLE IF NOT EXISTS delivery_receipts (
-            message_id   TEXT    PRIMARY KEY,
-            sender_id    INTEGER NOT NULL,
-            delivered_at REAL    DEFAULT (unixepoch()),
-            fetched      INTEGER DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS blocked (
-            user_id   INTEGER NOT NULL,
-            target_id INTEGER NOT NULL,
-            PRIMARY KEY (user_id, target_id)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_msg_receiver ON messages(receiver_id);
-        CREATE INDEX IF NOT EXISTS idx_receipts_sender ON delivery_receipts(sender_id, fetched);
-    """)
-    conn.commit()
-    conn.close()
-    print(f"[server] Database initialised at {DB_PATH}")
+class Friendship(db.Model):
+    __tablename__ = "friendships"
+    id      = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    user_a  = db.Column(db.String(64), nullable=False)
+    user_b  = db.Column(db.String(64), nullable=False)
+    db.UniqueConstraint("user_a", "user_b")
 
 
-# 5. Authentication Middleware
-def auth_required(f):
+class Block(db.Model):
+    __tablename__ = "blocks"
+    id      = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    blocker = db.Column(db.String(64), nullable=False)
+    blocked = db.Column(db.String(64), nullable=False)
+    db.UniqueConstraint("blocker", "blocked")
+
+
+class OfflineMessage(db.Model):
+    __tablename__ = "offline_messages"
+    id         = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    sender     = db.Column(db.String(64), nullable=False)
+    receiver   = db.Column(db.String(64), nullable=False)
+    ciphertext = db.Column(db.Text, nullable=False)
+    ad         = db.Column(db.Text, nullable=False)
+    ttl        = db.Column(db.Integer, nullable=False)
+    queued_at  = db.Column(db.Float, nullable=False, default=time.time)
+    expiry     = db.Column(db.Float, nullable=False)
+
+
+class RevokedToken(db.Model):
+    """JWT blacklist — stores jti (JWT ID) of logged-out tokens."""
+    __tablename__ = "revoked_tokens"
+    jti        = db.Column(db.String(64), primary_key=True)
+    revoked_at = db.Column(db.Float, nullable=False, default=time.time)
+
+
+# 3. Helpers
+
+PASSWORD_RE = re.compile(
+    r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=]).{10,72}$'
+)
+
+def hash_pw(password: str, salt: bytes) -> bytes:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 310_000)
+
+
+def _is_friend(user_a: str, user_b: str) -> bool:
+    return Friendship.query.filter(
+        ((Friendship.user_a == user_a) & (Friendship.user_b == user_b)) |
+        ((Friendship.user_a == user_b) & (Friendship.user_b == user_a))
+    ).first() is not None
+
+
+def _is_blocked(blocker: str, blocked: str) -> bool:
+    return Block.query.filter_by(blocker=blocker, blocked=blocked).first() is not None
+
+
+def _make_token(username: str) -> tuple[str, str]:
+    """Return (JWT string, jti) for the given user."""
+    jti = secrets.token_hex(16)
+    payload = {
+        "sub": username,
+        "jti": jti,
+        "iat": time.time(),
+        "exp": time.time() + app.config["JWT_EXPIRY_SECONDS"],
+    }
+    token = jwt.encode(payload, app.config["JWT_SECRET"], algorithm="HS256")
+    return token, jti
+
+
+def require_auth(f):
+    """Decorator: validates Bearer JWT, populates g.username."""
     @wraps(f)
     def wrapper(*args, **kwargs):
-        header = request.headers.get("Authorization", "")
-        if not header.startswith("Bearer "):
-            return jsonify({"error": "Unauthorized"}), 401
-        token   = header[7:]
-        payload = jwt_verify(token)
-        if not payload:
-            return jsonify({"error": "Invalid or expired token"}), 401
-        db  = get_db()
-        row = db.execute(
-            "SELECT user_id FROM active_tokens WHERE token=? AND expires_at>?",
-            (token, time.time()),
-        ).fetchone()
-        if not row:
-            return jsonify({"error": "Session expired — please log in again"}), 401
-        request.uid   = row["user_id"]
-        request.token = token
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return jsonify({"error": "Missing token"}), 401
+        raw = auth[7:]
+        try:
+            payload = jwt.decode(raw, app.config["JWT_SECRET"], algorithms=["HS256"])
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "Token expired"}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({"error": "Invalid token"}), 401
+
+        # Check blacklist (R3)
+        if RevokedToken.query.get(payload["jti"]):
+            return jsonify({"error": "Token revoked"}), 401
+
+        g.username = payload["sub"]
+        g.jti = payload["jti"]
         return f(*args, **kwargs)
     return wrapper
 
 
-# Helper
-def get_user_by_name(db, username: str):
-    return db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
 
-def are_friends(db, a: int, b: int) -> bool:
-    return bool(db.execute(
-        """SELECT 1 FROM friend_requests
-           WHERE ((sender_id=? AND receiver_id=?) OR (sender_id=? AND receiver_id=?))
-             AND status='accepted'""",
-        (a, b, b, a),
-    ).fetchone())
+# 4. Background cleanup worker  (R12, R21)
 
-
-
-# 6. Account management 
-# R1: register with username, password, and public keys (signing + DH)
-@app.post("/api/register")
-def register():
-    ip = request.remote_addr
-    if not rate_ok(f"reg:{ip}", 5, 300):   # 5 registrations per 5 min per IP
-        return jsonify({"error": "Rate limited — try again later"}), 429
-
-    data = request.get_json(force=True, silent=True) or {}
-    username = (data.get("username") or "").strip().lower()
-    password = data.get("password", "")
-
-    # Validate username (3-32 alphanumeric)
-    if not (3 <= len(username) <= 32) or not username.replace("_", "").isalnum():
-        return jsonify({"error": "Username: 3–32 chars, letters/digits/underscore only"}), 400
-    # Password policy: min 8 chars
-    if len(password) < 8:
-        return jsonify({"error": "Password must be at least 8 characters"}), 400
-    # Require public key material
-    for field in ("sign_pub", "ik_pub", "spk_pub", "spk_sig"):
-        if not data.get(field):
-            return jsonify({"error": f"Missing field: {field}"}), 400
-
-    db = get_db()
-    if get_user_by_name(db, username):
-        return jsonify({"error": "Username already taken"}), 409
-
-    totp_secret = C.gen_totp_secret()
-    db.execute(
-        "INSERT INTO users (username, pw_hash, totp_secret, sign_pub, ik_pub, spk_pub, spk_sig)"
-        " VALUES (?,?,?,?,?,?,?)",
-        (username, hash_password(password), totp_secret,
-         data["sign_pub"], data["ik_pub"], data["spk_pub"], data["spk_sig"]),
-    )
-    db.commit()
-    return jsonify({
-        "message":     "Account created",
-        "totp_secret": totp_secret,
-        "totp_uri":    f"otpauth://totp/SecureChat:{username}?secret={totp_secret}&issuer=SecureChat",
-    }), 201
-
-# R2 Login with username, password, and TOTP code; receive JWT session token
-@app.post("/api/login")
-def login():
-    ip = request.remote_addr
-    if not rate_ok(f"login:{ip}", 10, 60):  # 10 attempts per min per IP
-        return jsonify({"error": "Rate limited — try again later"}), 429
-
-    data     = request.get_json(force=True, silent=True) or {}
-    username = (data.get("username") or "").strip().lower()
-    password = data.get("password", "")
-    totp_in  = str(data.get("totp_code", "")).strip()
-
-    db   = get_db()
-    user = get_user_by_name(db, username)
-    # Constant-time: always check password even if user not found (mitigate timing oracle)
-    pw_ok = user and check_password(user["pw_hash"], password)
-    if not pw_ok:
-        return jsonify({"error": "Invalid credentials"}), 401
-    if not C.verify_totp(user["totp_secret"], totp_in):
-        return jsonify({"error": "Invalid TOTP code"}), 401
-
-    token = jwt_create(user["id"])
-    db.execute("INSERT INTO active_tokens VALUES (?,?,?)",
-               (token, user["id"], time.time() + TOKEN_TTL))
-    db.commit()
-    return jsonify({"token": token, "username": username}), 200
-
-# R3 Logout (invalidate session token)
-@app.post("/api/logout")
-@auth_required
-def logout():
-    get_db().execute("DELETE FROM active_tokens WHERE token=?", (request.token,))
-    get_db().commit()
-    return jsonify({"message": "Logged out"}), 200
-
-# r4 Public Key Distribution (see below)
-@app.get("/api/me")
-@auth_required
-def me():
-    row = get_db().execute("SELECT username FROM users WHERE id=?", (request.uid,)).fetchone()
-    return jsonify({"username": row["username"], "user_id": request.uid}), 200
-
-
-# 7. Public Key Distribution
-@app.get("/api/keys/<username>")
-@auth_required
-def get_keys(username):
-    """
-    Public key bundle for a user.
-    Server stores only public keys; private keys never leave the client.
-    """
-    u = get_user_by_name(get_db(), username.strip().lower())
-    if not u:
-        return jsonify({"error": "User not found"}), 404
-    return jsonify({
-        "username": u["username"],
-        "sign_pub": u["sign_pub"],
-        "ik_pub":   u["ik_pub"],
-        "spk_pub":  u["spk_pub"],
-        "spk_sig":  u["spk_sig"],
-    }), 200
-
-
-# 8. Friend management
-# Send Friend Request
-@app.post("/api/friends/request")
-@auth_required
-def friend_request():
-    if not rate_ok(f"fr:{request.uid}", 20, 60):
-        return jsonify({"error": "Rate limited"}), 429
-
-    data    = request.get_json(force=True, silent=True) or {}
-    to_name = (data.get("to") or "").strip().lower()
-    db      = get_db()
-    to_user = get_user_by_name(db, to_name)
-    if not to_user:
-        return jsonify({"error": "User not found"}), 404
-    if to_user["id"] == request.uid:
-        return jsonify({"error": "Cannot send friend request to yourself"}), 400
-    # Check if target has blocked sender
-    if db.execute("SELECT 1 FROM blocked WHERE user_id=? AND target_id=?",
-                  (to_user["id"], request.uid)).fetchone():
-        return jsonify({"error": "User not found"}), 404   # silent — don't reveal block
-    # Check duplicate
-    existing = db.execute(
-        "SELECT status FROM friend_requests WHERE sender_id=? AND receiver_id=?",
-        (request.uid, to_user["id"]),
-    ).fetchone()
-    if existing:
-        return jsonify({"error": f"Request already {existing['status']}"}), 409
-    # Check already friends (reverse direction accepted)
-    if are_friends(db, request.uid, to_user["id"]):
-        return jsonify({"error": "Already friends"}), 409
-
-    db.execute("INSERT INTO friend_requests (sender_id, receiver_id) VALUES (?,?)",
-               (request.uid, to_user["id"]))
-    db.commit()
-    return jsonify({"message": "Friend request sent"}), 201
-
-# Incoming Requests
-@app.get("/api/friends/requests/incoming")
-@auth_required
-def incoming_requests():
-    rows = get_db().execute("""
-        SELECT fr.id, u.username AS from_username, fr.created_at
-        FROM   friend_requests fr
-        JOIN   users u ON u.id = fr.sender_id
-        WHERE  fr.receiver_id=? AND fr.status='pending'
-        ORDER  BY fr.created_at DESC
-    """, (request.uid,)).fetchall()
-    return jsonify([dict(r) for r in rows]), 200
-
-# Outgoing Requests
-@app.get("/api/friends/requests/outgoing")
-@auth_required
-def outgoing_requests():
-    rows = get_db().execute("""
-        SELECT fr.id, u.username AS to_username, fr.status, fr.created_at
-        FROM   friend_requests fr
-        JOIN   users u ON u.id = fr.receiver_id
-        WHERE  fr.sender_id=? AND fr.status='pending'
-        ORDER  BY fr.created_at DESC
-    """, (request.uid,)).fetchall()
-    return jsonify([dict(r) for r in rows]), 200
-
-# Accept
-@app.post("/api/friends/requests/<int:req_id>/accept")
-@auth_required
-def accept_request(req_id):
-    db = get_db()
-    r  = db.execute(
-        "SELECT * FROM friend_requests WHERE id=? AND receiver_id=? AND status='pending'",
-        (req_id, request.uid),
-    ).fetchone()
-    if not r:
-        return jsonify({"error": "Request not found"}), 404
-    db.execute("UPDATE friend_requests SET status='accepted' WHERE id=?", (req_id,))
-    db.commit()
-    return jsonify({"message": "Friend request accepted"}), 200
-
-# Decline
-@app.post("/api/friends/requests/<int:req_id>/decline")
-@auth_required
-def decline_request(req_id):
-    db = get_db()
-    r  = db.execute(
-        "SELECT * FROM friend_requests WHERE id=? AND receiver_id=? AND status='pending'",
-        (req_id, request.uid),
-    ).fetchone()
-    if not r:
-        return jsonify({"error": "Request not found"}), 404
-    db.execute("UPDATE friend_requests SET status='declined' WHERE id=?", (req_id,))
-    db.commit()
-    return jsonify({"message": "Request declined"}), 200
-
-# Cancel
-@app.delete("/api/friends/requests/<int:req_id>")
-@auth_required
-def cancel_request(req_id):
-    db = get_db()
-    r  = db.execute(
-        "SELECT * FROM friend_requests WHERE id=? AND sender_id=? AND status='pending'",
-        (req_id, request.uid),
-    ).fetchone()
-    if not r:
-        return jsonify({"error": "Request not found"}), 404
-    db.execute("DELETE FROM friend_requests WHERE id=?", (req_id,))
-    db.commit()
-    return jsonify({"message": "Request cancelled"}), 200
-
-# List Friends
-@app.get("/api/friends")
-@auth_required
-def list_friends():
-    rows = get_db().execute("""
-        SELECT u.username, u.sign_pub, u.ik_pub, u.spk_pub, u.spk_sig
-        FROM   users u
-        WHERE  u.id IN (
-            SELECT receiver_id FROM friend_requests
-            WHERE  sender_id=? AND status='accepted'
-            UNION
-            SELECT sender_id FROM friend_requests
-            WHERE  receiver_id=? AND status='accepted'
-        )
-        ORDER BY u.username
-    """, (request.uid, request.uid)).fetchall()
-    return jsonify([dict(r) for r in rows]), 200
-
-# 9. Block / Unblock Users
-# Block
-@app.post("/api/block/<username>")
-@auth_required
-def block_user(username):
-    username = username.strip().lower()
-    db = get_db()
-    u  = get_user_by_name(db, username)
-    if not u:
-        return jsonify({"error": "User not found"}), 404
-    db.execute("INSERT OR IGNORE INTO blocked (user_id, target_id) VALUES (?,?)",
-               (request.uid, u["id"]))
-    db.execute("""DELETE FROM friend_requests
-                  WHERE (sender_id=? AND receiver_id=?)
-                     OR (sender_id=? AND receiver_id=?)""",
-               (request.uid, u["id"], u["id"], request.uid))
-    db.commit()
-    return jsonify({"message": f"Blocked {username}"}), 200
-
-# Unblock
-@app.post("/api/unblock/<username>")
-@auth_required
-def unblock_user(username):
-    username = username.strip().lower()
-    db = get_db()
-    u  = get_user_by_name(db, username)
-    if not u:
-        return jsonify({"error": "User not found"}), 404
-    db.execute("DELETE FROM blocked WHERE user_id=? AND target_id=?",
-               (request.uid, u["id"]))
-    db.commit()
-    return jsonify({"message": f"Unblocked {username}"}), 200
-
-
-# 10. Messaging System (Store-and-Forward)
-#  Send Message (Offline Queue)
-@app.post("/api/messages/send")
-@auth_required
-def send_message():
-    """
-    Relay an E2EE ciphertext envelope to recipient's offline queue.
-    Server sees: sender, receiver, message_id, timestamp, TTL, ciphertext blob.
-    Server cannot decrypt content (no private keys).
-    """
-    data    = request.get_json(force=True, silent=True) or {}
-    to_name = (data.get("to") or "").strip().lower()
-    db      = get_db()
-    to_user = get_user_by_name(db, to_name)
-    if not to_user:
-        return jsonify({"error": "User not found"}), 404
-    if not are_friends(db, request.uid, to_user["id"]):
-        return jsonify({"error": "Not friends — messages can only be sent to friends (R16)"}), 403
-    if db.execute("SELECT 1 FROM blocked WHERE user_id=? AND target_id=?",
-                  (to_user["id"], request.uid)).fetchone():
-        return jsonify({"error": "Blocked"}), 403
-
-    msg_id  = data.get("message_id")
-    payload = data.get("payload")
-    if not msg_id or not payload:
-        return jsonify({"error": "Missing message_id or payload"}), 400
-
-    # Extract TTL from (plaintext) AD to compute expiry (best-effort R12)
-    ttl = 0
-    try:
-        ad = payload.get("ad", {}) if isinstance(payload, dict) else {}
-        ttl = int(ad.get("ttl", 0))
-    except (TypeError, ValueError):
-        pass
-    expires_at = (time.time() + ttl) if ttl > 0 else None
-
-    # Idempotent insert — safe to retry
-    if db.execute("SELECT 1 FROM messages WHERE id=?", (msg_id,)).fetchone():
-        return jsonify({"status": "sent", "message_id": msg_id}), 200
-
-    payload_str = json.dumps(payload) if isinstance(payload, dict) else payload
-    db.execute(
-        "INSERT INTO messages (id, sender_id, receiver_id, payload, expires_at) VALUES (?,?,?,?,?)",
-        (msg_id, request.uid, to_user["id"], payload_str, expires_at),
-    )
-    db.commit()
-    return jsonify({"status": "sent", "message_id": msg_id}), 200
-
-# Poll Messages
-@app.get("/api/messages/poll")
-@auth_required
-def poll_messages():
-    """
-    Fetch pending ciphertext from the offline queue.
-    Returns at most 50 non-expired messages; client ACKs each to dequeue.
-    Metadata disclosed to server per R19: sender, receiver, timing, size.
-    """
-    now  = time.time()
-    rows = get_db().execute("""
-        SELECT m.id, u.username AS sender, m.payload, m.created_at, m.expires_at
-        FROM   messages m
-        JOIN   users u ON u.id = m.sender_id
-        WHERE  m.receiver_id=?
-          AND  (m.expires_at IS NULL OR m.expires_at > ?)
-        ORDER  BY m.created_at ASC
-        LIMIT  50
-    """, (request.uid, now)).fetchall()
-    return jsonify([dict(r) for r in rows]), 200
-
-# ACKnoledge Message (Dequeue)
-@app.post("/api/messages/<msg_id>/ack")
-@auth_required
-def ack_message(msg_id):
-    """
-    Receiver acknowledges a message (R18 Option B).
-    - Removes from queue (delivered).
-    - Writes delivery receipt for sender to poll.
-    """
-    db  = get_db()
-    msg = db.execute(
-        "SELECT sender_id FROM messages WHERE id=? AND receiver_id=?",
-        (msg_id, request.uid),
-    ).fetchone()
-    if not msg:
-        # Already ACKed — idempotent
-        return jsonify({"status": "ok"}), 200
-    db.execute("DELETE FROM messages WHERE id=?", (msg_id,))
-    db.execute(
-        "INSERT OR IGNORE INTO delivery_receipts (message_id, sender_id) VALUES (?,?)",
-        (msg_id, msg["sender_id"]),
-    )
-    db.commit()
-    return jsonify({"status": "acked"}), 200
-
-# Delivery Receipts Polling
-@app.get("/api/receipts/poll")
-@auth_required
-def poll_receipts():
-    """
-    Sender polls for delivery receipts (R17 'Delivered' status).
-    Returns un-fetched receipts and marks them as fetched.
-    """
-    db   = get_db()
-    rows = db.execute(
-        "SELECT message_id, delivered_at FROM delivery_receipts WHERE sender_id=? AND fetched=0",
-        (request.uid,),
-    ).fetchall()
-    if rows:
-        ids = [r["message_id"] for r in rows]
-        db.execute(
-            f"UPDATE delivery_receipts SET fetched=1 WHERE message_id IN ({','.join('?'*len(ids))})",
-            ids,
-        )
-        db.commit()
-    return jsonify([dict(r) for r in rows]), 200
-
-
-# 12. TTL + Background cleanup 
-def _cleanup_loop():
-    """Periodically purge expired data (TTL, stale tokens, old receipts)."""
+def _cleanup_worker():
+    """Runs every 5 minutes. Deletes expired and over-age messages."""
     while True:
-        time.sleep(CLEANUP_INTERVAL)
+        time.sleep(300)
         try:
-            conn = sqlite3.connect(DB_PATH, timeout=10)
-            now  = time.time()
-            conn.execute("DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at<=?", (now,))
-            conn.execute("DELETE FROM active_tokens WHERE expires_at<=?", (now,))
-            conn.execute("DELETE FROM delivery_receipts WHERE fetched=1 AND delivered_at<?", (now - 86_400,))
-            # Hard-cap old messages regardless of TTL
-            conn.execute("DELETE FROM messages WHERE created_at<?", (now - MSG_MAX_AGE,))
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            print(f"[cleanup] {e}", file=sys.stderr)
+            with app.app_context():
+                now = time.time()
+                cutoff = now - MAX_QUEUE_AGE_DAYS * 86400
+                deleted = OfflineMessage.query.filter(
+                    (OfflineMessage.expiry < now) |
+                    (OfflineMessage.queued_at < cutoff)
+                ).delete(synchronize_session=False)
+                db.session.commit()
+                if deleted:
+                    app.logger.info(f"[cleanup] Removed {deleted} stale offline messages")
+        except Exception as exc:
+            app.logger.error(f"[cleanup] Error: {exc}")
 
 
-# Entry point 
+
+# 5. Routes – Registration & Authentication (R1, R2, R3)
+@app.route("/register", methods=["POST"])
+@limiter.limit("5 per minute")
+def register():
+    # (R1) Register: username + password (complexity enforced) + pub_key → OTP secret.
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password", "")
+    pub_key  = data.get("pub_key", "")
+
+    if not username or not password or not pub_key:
+        return jsonify({"error": "Missing fields"}), 400
+    if len(username) > 64:
+        return jsonify({"error": "Username too long"}), 400
+    if not re.match(r'^[A-Za-z0-9_\-]+$', username):
+        return jsonify({"error": "Invalid username characters"}), 400
+    if not PASSWORD_RE.match(password):
+        return jsonify({
+            "error": (
+                "Password must be 10–72 chars and contain at least one "
+                "uppercase letter, lowercase letter, digit, and special character."
+            )
+        }), 400
+    if User.query.get(username):
+        return jsonify({"error": "Username already exists"}), 409
+
+    salt = os.urandom(16)
+    user = User(
+        username=username,
+        pw_hash=hash_pw(password, salt),
+        salt=salt,
+        otp_secret=pyotp.random_base32(),
+        pub_key=pub_key,
+    )
+    db.session.add(user)
+    db.session.commit()
+    return jsonify({"otp_secret": user.otp_secret}), 201
+
+
+@app.route("/login", methods=["POST"])
+@limiter.limit("10 per minute")
+def login():
+    # (R2) Login: password + OTP → signed JWT.
+    data = request.get_json(silent=True) or {}
+    user = User.query.get(data.get("username", ""))
+    if (
+        not user
+        or hash_pw(data.get("password", ""), user.salt) != user.pw_hash
+        or not pyotp.TOTP(user.otp_secret).verify(str(data.get("otp", "")))
+    ):
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    token, _ = _make_token(user.username)
+    return jsonify({"token": token})
+
+
+@app.route("/logout", methods=["POST"])
+@require_auth
+def logout():
+    """(R3) Logout: blacklist current JWT so it can no longer be used."""
+    db.session.add(RevokedToken(jti=g.jti))
+    db.session.commit()
+    return jsonify({"msg": "Logged out"})
+
+
+
+# 6. Routes – Contact / Friend Management  (R13, R14, R15)
+@app.route("/friend_request", methods=["POST"])
+@require_auth
+@limiter.limit("30 per minute")
+def friend_request():
+    # (R13) Send a friend request.
+    target = (request.get_json(silent=True) or {}).get("target", "").strip()
+    sender = g.username
+    if not User.query.get(target):
+        return jsonify({"error": "User not found"}), 404
+    if target == sender:
+        return jsonify({"error": "Cannot friend yourself"}), 400
+    if _is_blocked(target, sender):
+        # Silently succeed so sender doesn't learn they are blocked (R15)
+        return jsonify({"msg": "Sent"})
+    if _is_friend(sender, target):
+        return jsonify({"error": "Already friends"}), 409
+    if FriendRequest.query.filter_by(sender=sender, receiver=target).first():
+        return jsonify({"error": "Request already pending"}), 409
+
+    db.session.add(FriendRequest(sender=sender, receiver=target))
+    db.session.commit()
+    return jsonify({"msg": "Sent"})
+
+
+@app.route("/accept_friend", methods=["POST"])
+@require_auth
+def accept_friend():
+    # (R13) Accept a pending friend request.
+    friend = (request.get_json(silent=True) or {}).get("friend", "").strip()
+    user = g.username
+    req = FriendRequest.query.filter_by(sender=friend, receiver=user).first()
+    if not req:
+        return jsonify({"error": "No such request"}), 404
+    db.session.delete(req)
+    db.session.add(Friendship(user_a=user, user_b=friend))
+    db.session.commit()
+    return jsonify({"msg": "Accepted"})
+
+
+@app.route("/decline_friend", methods=["POST"])
+@require_auth
+def decline_friend():
+    # (R14) Decline an incoming friend request.
+    friend = (request.get_json(silent=True) or {}).get("friend", "").strip()
+    req = FriendRequest.query.filter_by(sender=friend, receiver=g.username).first()
+    if not req:
+        return jsonify({"error": "No such request"}), 404
+    db.session.delete(req)
+    db.session.commit()
+    return jsonify({"msg": "Declined"})
+
+
+@app.route("/cancel_friend_request", methods=["POST"])
+@require_auth
+def cancel_friend_request():
+    # (R14) Cancel an outgoing friend request before it is accepted.
+    target = (request.get_json(silent=True) or {}).get("target", "").strip()
+    req = FriendRequest.query.filter_by(sender=g.username, receiver=target).first()
+    if not req:
+        return jsonify({"error": "No such request"}), 404
+    db.session.delete(req)
+    db.session.commit()
+    return jsonify({"msg": "Cancelled"})
+
+
+@app.route("/block_user", methods=["POST"])
+@require_auth
+def block_user():
+    # (R15) Block a user: drops any pending request and prevents future contact.
+    target = (request.get_json(silent=True) or {}).get("target", "").strip()
+    if not target or target == g.username:
+        return jsonify({"error": "Invalid target"}), 400
+    if not _is_blocked(g.username, target):
+        db.session.add(Block(blocker=g.username, blocked=target))
+    # Remove any pending friend request from that user
+    FriendRequest.query.filter_by(sender=target, receiver=g.username).delete()
+    db.session.commit()
+    return jsonify({"msg": "Blocked"})
+
+
+@app.route("/unblock_user", methods=["POST"])
+@require_auth
+def unblock_user():
+    # (R15) Unblock a previously blocked user.
+    target = (request.get_json(silent=True) or {}).get("target", "").strip()
+    Block.query.filter_by(blocker=g.username, blocked=target).delete()
+    db.session.commit()
+    return jsonify({"msg": "Unblocked"})
+
+
+
+# Routes – Messaging  (R16, R17, R20, R21, R22)
+
+@app.route("/send_message", methods=["POST"])
+@require_auth
+@limiter.limit("120 per minute")
+def send_message():
+    # (R16, R17, R21, R22) Send an encrypted message to a friend.
+    data = request.get_json(silent=True) or {}
+    sender   = g.username
+    receiver = data.get("receiver", "").strip()
+    ciphertext = data.get("ciphertext", "")
+    ad         = data.get("ad", "")
+    ttl        = int(data.get("ttl", 60))
+
+    # (R22) Payload size cap
+    if len(ciphertext.encode()) > MAX_MESSAGE_BYTES:
+        return jsonify({"error": "Payload too large"}), 413
+
+    if not receiver or not ciphertext or not ad:
+        return jsonify({"error": "Missing fields"}), 400
+
+    # (R15) Honour block list in both directions
+    if _is_blocked(receiver, sender) or _is_blocked(sender, receiver):
+        return jsonify({"error": "Forbidden"}), 403
+
+    # (R16) Friends-only messaging
+    if not _is_friend(sender, receiver):
+        return jsonify({"error": "Not friends"}), 403
+
+    # (R21) Per-user queue size cap
+    queue_size = OfflineMessage.query.filter_by(receiver=receiver).count()
+    if queue_size >= MAX_QUEUE_SIZE:
+        return jsonify({"error": "Receiver queue full"}), 429
+
+    expiry = time.time() + max(1, min(ttl, 2_592_000))  # cap at 30 days
+    msg = OfflineMessage(
+        sender=sender,
+        receiver=receiver,
+        ciphertext=ciphertext,
+        ad=ad,
+        ttl=ttl,
+        queued_at=time.time(),
+        expiry=expiry,
+    )
+    db.session.add(msg)
+    db.session.commit()
+    return jsonify({"status": "Sent", "msg_id": msg.id})  # (R17)
+
+
+@app.route("/sync/<username>", methods=["GET"])
+@require_auth
+def sync(username):
+    # (R20) Fetch offline queue and pending friend requests. Clears fetched messages.
+    if g.username != username:
+        return jsonify({"error": "Forbidden"}), 403
+
+    now = time.time()
+    msgs = OfflineMessage.query.filter(
+        OfflineMessage.receiver == username,
+        OfflineMessage.expiry > now,
+    ).all()
+
+    payload = [
+        {
+            "msg_id":     m.id,
+            "sender":     m.sender,
+            "ciphertext": m.ciphertext,
+            "ad":         m.ad,
+            "ttl":        m.ttl,
+        }
+        for m in msgs
+    ]
+
+    # Delete delivered messages
+    ids = [m.id for m in msgs]
+    if ids:
+        OfflineMessage.query.filter(OfflineMessage.id.in_(ids)).delete(
+            synchronize_session=False
+        )
+
+    # Pending friend requests
+    reqs = [r.sender for r in FriendRequest.query.filter_by(receiver=username).all()]
+
+    db.session.commit()
+    return jsonify({"messages": payload, "friend_requests": reqs})
+
+
+@app.route("/get_key/<username>", methods=["GET"])
+@require_auth
+def get_key(username):
+    user = User.query.get(username)
+    if not user:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify({"pub_key": user.pub_key})
+
+
+
+# 7. App init
+
+def create_app():
+    with app.app_context():
+        db.create_all()
+    t = threading.Thread(target=_cleanup_worker, daemon=True)
+    t.start()
+    return app
+
+
 if __name__ == "__main__":
-    init_db()
-    # Start background cleanup thread (daemon)
-    threading.Thread(target=_cleanup_loop, daemon=True, name="cleanup").start()
-    print(f"[server] Listening on http://0.0.0.0:{PORT}")
-    print(f"[server] DB: {DB_PATH}")
-    print("[server] Press Ctrl-C to stop\n")
-
-    app.run(host="0.0.0.0", port=PORT, threaded=True, use_reloader=False)
+    create_app()
+    # Production: use Gunicorn + TLS certificates
+    # gunicorn -w 4 --certfile cert.pem --keyfile key.pem "server:app"
+    # (4.2) Transport security: In production use ssl_context=('cert.pem', 'key.pem')
+    app.run(port=5000, debug=False)
