@@ -115,6 +115,8 @@ class SecureSession:
         self.fingerprint = hashlib.sha256(shared_key).hexdigest()[:16]
 
     def encrypt_message(self, plaintext: bytes):
+        if isinstance(plaintext, str):
+            plaintext = plaintext.encode('utf-8')
         ad = ADBuilder.build_ad(self.session_id, self.sequence_number, self.fingerprint)
         nonce = os.urandom(12)
         chacha = ChaCha20Poly1305(self.key)
@@ -194,7 +196,7 @@ if __name__ == "__main__":
     bob_session = bob.receive_session(alice_ik_bytes, alice_ek_bytes, bob_otpk_pri)
 
     # Encrypt
-    msg = b"M-1-(-k-@-y m-0-u-$-5"
+    msg = "kkkkkk看看看看嗎？"
     c_blob, c_ad = alice_session.encrypt_message(msg)
     print(f"Encrypted: {c_blob}")
 
