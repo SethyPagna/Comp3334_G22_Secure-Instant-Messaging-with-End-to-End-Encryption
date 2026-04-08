@@ -35,6 +35,18 @@ class x25519_key:
         return private_key.public_key()
     
     @staticmethod
+    def x25519_private_key_serialization(private_key, password):
+        return private_key.private_bytes(
+            encoding = serialization.Encoding.PEM,
+            format = serialization.PrivateFormat.PKCS8,
+            encryption_algorithm = serialization.BestAvailableEncryption(password.encode())
+        )
+
+    @staticmethod
+    def x25519_private_key_deserialization(private_key_bytes):
+        return X25519PrivateKey.from_private_bytes(private_key_bytes)
+        
+    @staticmethod
     def x25519_public_key_serialization(public_key):
         return public_key.public_bytes(
             encoding = serialization.Encoding.Raw,
@@ -144,8 +156,24 @@ class SecureSession:
         return plaintext
 
 class CryptoHandler:
-    def __init__(self):
-        self.ik_pri = x25519_key.x25519_private_key_generation()
+    def __init__(self, user_id):
+        self.user_id = user_id
+        self.service_name = "X9jL2pW8mN4kR7vQ1sT5bY3zH6gD0fC9jK2lM8nP4qR7sT5vW1"
+        
+        stored_key = keyring.get_password(self.service_name, f"{user_id}_identity_pri")
+
+        if stored_key:
+            # --- DESERIALIZATION ---
+            private_key_bytes = base64.b64decode(stored_key)
+            self.ik_pri = x25519_key.x25519_private_key_deserialization(key_bytes)
+        else:
+            # --- GENERATION & SERIALIZATION ---
+            self.ik_pri = X25519PrivateKey.generate()
+            # Serialize to raw bytes for storage
+            private_key_bytes = x25519_key.x25519_private_key_serialization(self.ik_pri)
+            b64_key = base64.b64encode(private_key_bytes).decode('utf-8')
+            keyring.set_password(self.service_name, f"{user_id}_identity_pri", b64_key)
+
         self.ik_pub = x25519_key.x25519_public_key_generation(self.ik_pri)
         self.sig_key_pri = ed25519_key.ed25519_private_key_generation()
         self.sig_key_pub = ed25519_key.ed25519_public_key_generation(self.sig_key_pri)
@@ -182,24 +210,24 @@ class CryptoHandler:
         return SecureSession("Bob", session_key)
 
 # running test case
-if __name__ == "__main__":
-    alice = CryptoHandler()
-    bob = CryptoHandler()
+# if __name__ == "__main__":
+#     alice = CryptoHandler()
+#     bob = CryptoHandler()
 
-    bob_bundle = bob.get_bundle()
-    bob_otpk_pri = x25519_key.x25519_private_key_generation()
-    bob_otpk_pub_bytes = x25519_key.x25519_public_key_serialization(x25519_key.x25519_public_key_generation(bob_otpk_pri))
+#     bob_bundle = bob.get_bundle()
+#     bob_otpk_pri = x25519_key.x25519_private_key_generation()
+#     bob_otpk_pub_bytes = x25519_key.x25519_public_key_serialization(x25519_key.x25519_public_key_generation(bob_otpk_pri))
 
-    alice_session, alice_ek_bytes = alice.initiate_session(bob_bundle, bob_otpk_pub_bytes)
-    alice_ik_bytes = x25519_key.x25519_public_key_serialization(alice.ik_pub)
+#     alice_session, alice_ek_bytes = alice.initiate_session(bob_bundle, bob_otpk_pub_bytes)
+#     alice_ik_bytes = x25519_key.x25519_public_key_serialization(alice.ik_pub)
     
-    bob_session = bob.receive_session(alice_ik_bytes, alice_ek_bytes, bob_otpk_pri)
+#     bob_session = bob.receive_session(alice_ik_bytes, alice_ek_bytes, bob_otpk_pri)
 
-    # Encrypt
-    msg = "kkkkkk看看看看嗎？"
-    c_blob, c_ad = alice_session.encrypt_message(msg)
-    print(f"Encrypted: {c_blob}")
+#     # Encrypt
+#     msg = "kkkkkk看看看看嗎？"
+#     c_blob, c_ad = alice_session.encrypt_message(msg)
+#     print(f"Encrypted: {c_blob}")
 
-    # Decrypt
-    p_text = bob_session.decrypt_message(c_blob, c_ad)
-    print(f"Decrypted: {p_text.decode()}")
+#     # Decrypt
+#     p_text = bob_session.decrypt_message(c_blob, c_ad)
+#     print(f"Decrypted: {p_text.decode()}")
