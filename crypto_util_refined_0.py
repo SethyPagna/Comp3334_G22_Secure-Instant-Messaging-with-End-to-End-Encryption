@@ -38,8 +38,8 @@ class x25519_key:
     @staticmethod
     def x25519_private_key_serialization(private_key):
         return private_key.private_bytes(
-            encoding = serialization.Encoding.PEM,
-            format = serialization.PrivateFormat.PKCS8,
+            encoding = serialization.Encoding.Raw,
+            format = serialization.PrivateFormat.Raw,
             encryption_algorithm = serialization.NoEncryption()
         )
 
@@ -211,24 +211,33 @@ class CryptoHandler:
         return SecureSession("Bob", session_key)
 
 # running test case
-if __name__ == "__main__":
-    alice = CryptoHandler(1)
-    bob = CryptoHandler(2)
+# if __name__ == "__main__":
+#     try:
+#         # Delete the Identity Key
+#         keyring.delete_password("X9jL2pW8mN4kR7vQ1sT5bY3zH6gD0fC9jK2lM8nP4qR7sT5vW1", f"{1}_identity_pri")
+#         print(f"[*] Success: Identity key for {1} has been deleted.")
+#         keyring.delete_password("X9jL2pW8mN4kR7vQ1sT5bY3zH6gD0fC9jK2lM8nP4qR7sT5vW1", f"{2}_identity_pri")
+#         print(f"[*] Success: Identity key for {2} has been deleted.")
+#     except keyring.errors.PasswordDeleteError:
+#         print("[!] Error: Key not found or already deleted.")
 
-    bob_bundle = bob.get_bundle()
-    bob_otpk_pri = x25519_key.x25519_private_key_generation()
-    bob_otpk_pub_bytes = x25519_key.x25519_public_key_serialization(x25519_key.x25519_public_key_generation(bob_otpk_pri))
+#     alice = CryptoHandler(1)
+#     bob = CryptoHandler(2)
 
-    alice_session, alice_ek_bytes = alice.initiate_session(bob_bundle, bob_otpk_pub_bytes)
-    alice_ik_bytes = x25519_key.x25519_public_key_serialization(alice.ik_pub)
+#     bob_bundle = bob.get_bundle()
+#     bob_otpk_pri = x25519_key.x25519_private_key_generation()
+#     bob_otpk_pub_bytes = x25519_key.x25519_public_key_serialization(x25519_key.x25519_public_key_generation(bob_otpk_pri))
+
+#     alice_session, alice_ek_bytes = alice.initiate_session(bob_bundle, bob_otpk_pub_bytes)
+#     alice_ik_bytes = x25519_key.x25519_public_key_serialization(alice.ik_pub)
     
-    bob_session = bob.receive_session(alice_ik_bytes, alice_ek_bytes, bob_otpk_pri)
+#     bob_session = bob.receive_session(alice_ik_bytes, alice_ek_bytes, bob_otpk_pri)
 
-    # Encrypt
-    msg = "kkkkkk看看看看嗎？"
-    c_blob, c_ad = alice_session.encrypt_message(msg)
-    print(f"Encrypted: {c_blob}")
+#     # Encrypt
+#     msg = "kkkkkk看看看看嗎？"
+#     c_blob, c_ad = alice_session.encrypt_message(msg)
+#     print(f"Encrypted: {c_blob}")
 
-    # Decrypt
-    p_text = bob_session.decrypt_message(c_blob, c_ad)
-    print(f"Decrypted: {p_text.decode()}")
+#     # Decrypt
+#     p_text = bob_session.decrypt_message(c_blob, c_ad)
+#     print(f"Decrypted: {p_text.decode()}")
