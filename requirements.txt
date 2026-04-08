@@ -16,5 +16,3 @@ cryptography>=42.0
 # HTTP client (for client.py)
 requests>=2.31
 
-# Production WSGI server (optional but recommended)
-# gunicorn>=21.0
