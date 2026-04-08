@@ -121,7 +121,7 @@ class ADBuilder:
         return s_id_bytes + b"|" + seq_bytes + b"|" + fp_bytes
 
 class SecureSession:
-    def __init__(self, sender_id: str, shared_key: bytes):
+    def __init__(self, shared_key: bytes):
         self.session_id = uuid.uuid4().hex[:8]
         self.key = shared_key
         self.sequence_number = 0
@@ -202,42 +202,42 @@ class CryptoHandler:
         session_key = X3DH.x3DH_sending_session_key(
             self.ik_pri, ek_pri, peer_bundle['ik'], peer_bundle['spk'], peer_otpk_bytes
         )
-        return SecureSession("Alice", session_key), ek_pub_bytes
+        return SecureSession(session_key), ek_pub_bytes
 
     def receive_session(self, sender_ik_bytes, sender_ek_bytes, otpk_pri):
         session_key = X3DH.x3DH_receiving_session_key(
             self.ik_pri, self.spk_pri, otpk_pri, sender_ik_bytes, sender_ek_bytes
         )
-        return SecureSession("Bob", session_key)
+        return SecureSession(session_key)
 
 # running test case
-# if __name__ == "__main__":
-#     try:
-#         # Delete the Identity Key
-#         keyring.delete_password("X9jL2pW8mN4kR7vQ1sT5bY3zH6gD0fC9jK2lM8nP4qR7sT5vW1", f"{1}_identity_pri")
-#         print(f"[*] Success: Identity key for {1} has been deleted.")
-#         keyring.delete_password("X9jL2pW8mN4kR7vQ1sT5bY3zH6gD0fC9jK2lM8nP4qR7sT5vW1", f"{2}_identity_pri")
-#         print(f"[*] Success: Identity key for {2} has been deleted.")
-#     except keyring.errors.PasswordDeleteError:
-#         print("[!] Error: Key not found or already deleted.")
+if __name__ == "__main__":
+    # try:
+    #     # Delete the Identity Key
+    #     keyring.delete_password("X9jL2pW8mN4kR7vQ1sT5bY3zH6gD0fC9jK2lM8nP4qR7sT5vW1", f"{1}_identity_pri")
+    #     print(f"[*] Success: Identity key for {1} has been deleted.")
+    #     keyring.delete_password("X9jL2pW8mN4kR7vQ1sT5bY3zH6gD0fC9jK2lM8nP4qR7sT5vW1", f"{2}_identity_pri")
+    #     print(f"[*] Success: Identity key for {2} has been deleted.")
+    # except keyring.errors.PasswordDeleteError:
+    #     print("[!] Error: Key not found or already deleted.")
 
-#     alice = CryptoHandler(1)
-#     bob = CryptoHandler(2)
+    alice = CryptoHandler(1)
+    bob = CryptoHandler(2)
 
-#     bob_bundle = bob.get_bundle()
-#     bob_otpk_pri = x25519_key.x25519_private_key_generation()
-#     bob_otpk_pub_bytes = x25519_key.x25519_public_key_serialization(x25519_key.x25519_public_key_generation(bob_otpk_pri))
+    bob_bundle = bob.get_bundle()
+    bob_otpk_pri = x25519_key.x25519_private_key_generation()
+    bob_otpk_pub_bytes = x25519_key.x25519_public_key_serialization(x25519_key.x25519_public_key_generation(bob_otpk_pri))
 
-#     alice_session, alice_ek_bytes = alice.initiate_session(bob_bundle, bob_otpk_pub_bytes)
-#     alice_ik_bytes = x25519_key.x25519_public_key_serialization(alice.ik_pub)
+    alice_session, alice_ek_bytes = alice.initiate_session(bob_bundle, bob_otpk_pub_bytes)
+    alice_ik_bytes = x25519_key.x25519_public_key_serialization(alice.ik_pub)
     
-#     bob_session = bob.receive_session(alice_ik_bytes, alice_ek_bytes, bob_otpk_pri)
+    bob_session = bob.receive_session(alice_ik_bytes, alice_ek_bytes, bob_otpk_pri)
 
-#     # Encrypt
-#     msg = "kkkkkk看看看看嗎？"
-#     c_blob, c_ad = alice_session.encrypt_message(msg)
-#     print(f"Encrypted: {c_blob}")
+    # Encrypt
+    msg = "kkkkkk看看看看嗎？"
+    c_blob, c_ad = alice_session.encrypt_message(msg)
+    print(f"Encrypted: {c_blob}")
 
-#     # Decrypt
-#     p_text = bob_session.decrypt_message(c_blob, c_ad)
-#     print(f"Decrypted: {p_text.decode()}")
+    # Decrypt
+    p_text = bob_session.decrypt_message(c_blob, c_ad)
+    print(f"Decrypted: {p_text.decode()}")
