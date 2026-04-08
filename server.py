@@ -72,6 +72,7 @@ class OfflineMessage(db.Model):
     receiver   = db.Column(db.String(64), nullable=False)
     ciphertext = db.Column(db.Text, nullable=False)
     ad         = db.Column(db.Text, nullable=False)
+    ephemeral_key = db.Column(db.Text, nullable=True)
     ttl        = db.Column(db.Integer, nullable=False)
     queued_at  = db.Column(db.Float, nullable=False, default=time.time)
     expiry     = db.Column(db.Float, nullable=False)
@@ -389,6 +390,7 @@ def send_message():
         receiver=receiver,
         ciphertext=ciphertext,
         ad=ad,
+        ephemeral_key=data.get("ephemeral_key"),
         ttl=ttl,
         queued_at=time.time(),
         expiry=expiry,
