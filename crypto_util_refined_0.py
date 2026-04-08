@@ -9,6 +9,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 import hmac, hashlib, time, struct, base64
 import uuid
+import keyring
 
 # --- Utility Classes ---
 
@@ -35,11 +36,11 @@ class x25519_key:
         return private_key.public_key()
     
     @staticmethod
-    def x25519_private_key_serialization(private_key, password):
+    def x25519_private_key_serialization(private_key):
         return private_key.private_bytes(
             encoding = serialization.Encoding.PEM,
             format = serialization.PrivateFormat.PKCS8,
-            encryption_algorithm = serialization.BestAvailableEncryption(password.encode())
+            encryption_algorithm = serialization.NoEncryption()
         )
 
     @staticmethod
@@ -165,7 +166,7 @@ class CryptoHandler:
         if stored_key:
             # --- DESERIALIZATION ---
             private_key_bytes = base64.b64decode(stored_key)
-            self.ik_pri = x25519_key.x25519_private_key_deserialization(key_bytes)
+            self.ik_pri = x25519_key.x25519_private_key_deserialization(private_key_bytes)
         else:
             # --- GENERATION & SERIALIZATION ---
             self.ik_pri = X25519PrivateKey.generate()
@@ -210,24 +211,24 @@ class CryptoHandler:
         return SecureSession("Bob", session_key)
 
 # running test case
-# if __name__ == "__main__":
-#     alice = CryptoHandler()
-#     bob = CryptoHandler()
+if __name__ == "__main__":
+    alice = CryptoHandler(1)
+    bob = CryptoHandler(2)
 
-#     bob_bundle = bob.get_bundle()
-#     bob_otpk_pri = x25519_key.x25519_private_key_generation()
-#     bob_otpk_pub_bytes = x25519_key.x25519_public_key_serialization(x25519_key.x25519_public_key_generation(bob_otpk_pri))
+    bob_bundle = bob.get_bundle()
+    bob_otpk_pri = x25519_key.x25519_private_key_generation()
+    bob_otpk_pub_bytes = x25519_key.x25519_public_key_serialization(x25519_key.x25519_public_key_generation(bob_otpk_pri))
 
-#     alice_session, alice_ek_bytes = alice.initiate_session(bob_bundle, bob_otpk_pub_bytes)
-#     alice_ik_bytes = x25519_key.x25519_public_key_serialization(alice.ik_pub)
+    alice_session, alice_ek_bytes = alice.initiate_session(bob_bundle, bob_otpk_pub_bytes)
+    alice_ik_bytes = x25519_key.x25519_public_key_serialization(alice.ik_pub)
     
-#     bob_session = bob.receive_session(alice_ik_bytes, alice_ek_bytes, bob_otpk_pri)
+    bob_session = bob.receive_session(alice_ik_bytes, alice_ek_bytes, bob_otpk_pri)
 
-#     # Encrypt
-#     msg = "kkkkkk看看看看嗎？"
-#     c_blob, c_ad = alice_session.encrypt_message(msg)
-#     print(f"Encrypted: {c_blob}")
+    # Encrypt
+    msg = "kkkkkk看看看看嗎？"
+    c_blob, c_ad = alice_session.encrypt_message(msg)
+    print(f"Encrypted: {c_blob}")
 
-#     # Decrypt
-#     p_text = bob_session.decrypt_message(c_blob, c_ad)
-#     print(f"Decrypted: {p_text.decode()}")
+    # Decrypt
+    p_text = bob_session.decrypt_message(c_blob, c_ad)
+    print(f"Decrypted: {p_text.decode()}")
