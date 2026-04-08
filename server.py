@@ -333,7 +333,21 @@ def unblock_user():
     db.session.commit()
     return jsonify({"msg": "Unblocked"})
 
-
+@app.route("/friends", methods=["GET"])
+@require_auth
+def get_friends():
+    # Fetch all friendships where the current user is either user_a or user_b
+    friends = Friendship.query.filter(
+        (Friendship.user_a == g.username) | (Friendship.user_b == g.username)
+    ).all()
+    
+    # Extract the "other" username from each record
+    friend_list = []
+    for f in friends:
+        friend_name = f.user_b if f.user_a == g.username else f.user_a
+        friend_list.append(friend_name)
+        
+    return jsonify({"friends": friend_list})
 
 # Routes – Messaging  (R16, R17, R20, R21, R22)
 
