@@ -1,0 +1,20 @@
+# SecureChat – Python dependencies
+# Install with: pip install -r requirements.txt
+
+# Web framework & extensions
+flask>=3.0
+flask-sqlalchemy>=3.1
+flask-limiter>=3.5
+
+# Authentication
+PyJWT>=2.8
+pyotp>=2.9
+
+# Cryptography
+cryptography>=42.0
+
+# HTTP client (for client.py)
+requests>=2.31
+
+# Production WSGI server (optional but recommended)
+# gunicorn>=21.0
