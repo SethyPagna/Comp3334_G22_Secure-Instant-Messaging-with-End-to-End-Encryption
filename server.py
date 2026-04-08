@@ -83,7 +83,18 @@ class RevokedToken(db.Model):
     jti        = db.Column(db.String(64), primary_key=True)
     revoked_at = db.Column(db.Float, nullable=False, default=time.time)
 
+class PreKeyBundle(db.Model):
+    __tablename__ = "prekey_bundles"
+    username = db.Column(db.String(64), db.ForeignKey('users.username'), primary_key=True)
+    identity_key = db.Column(db.Text, nullable=False) # Your current pub_key
+    signed_pre_key = db.Column(db.Text, nullable=False)
+    signature = db.Column(db.Text, nullable=False)
 
+class OneTimePreKey(db.Model):
+    __tablename__ = "otps"
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(64), db.ForeignKey('users.username'))
+    key_data = db.Column(db.Text, nullable=False)
 # 3. Helpers
 
 PASSWORD_RE = re.compile(
@@ -411,13 +422,27 @@ def sync(username):
     return jsonify({"messages": payload, "friend_requests": reqs})
 
 
-@app.route("/get_key/<username>", methods=["GET"])
+@app.route("/get_bundle/<username>", methods=["GET"])
 @require_auth
-def get_key(username):
-    user = User.query.get(username)
-    if not user:
-        return jsonify({"error": "Not found"}), 404
-    return jsonify({"pub_key": user.pub_key})
+def get_bundle(username):
+    # 1. Fetch the long-term keys
+    bundle = PreKeyBundle.query.get(username)
+    # 2. Fetch ONE one-time pre-key
+    opk = OneTimePreKey.query.filter_by(username=username).first()
+    
+    # 3. If OPK exists, return it and then DELETE it from DB
+    opk_data = None
+    if opk:
+        opk_data = opk.key_data
+        db.session.delete(opk)
+        db.session.commit()
+
+    return jsonify({
+        "ik": bundle.identity_key,
+        "spk": bundle.signed_pre_key,
+        "sig": bundle.signature,
+        "opk": opk_data
+    })
 
 
 
