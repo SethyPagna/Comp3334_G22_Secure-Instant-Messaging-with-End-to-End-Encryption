@@ -1,15 +1,19 @@
+import os
+import hmac
+import hashlib
+import time
+import struct
+import base64
+import uuid
+import keyring
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, NoEncryption
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 import cryptography.hazmat.primitives.serialization as serialization
-import os
 from cryptography.hazmat.primitives.asymmetric import ed25519
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-import hmac, hashlib, time, struct, base64
-import uuid
-import keyring
 
 # --- Utility Classes ---
 
@@ -211,33 +215,33 @@ class CryptoHandler:
         return SecureSession(session_key)
 
 # running test case
-if __name__ == "__main__":
-    # try:
-    #     # Delete the Identity Key
-    #     keyring.delete_password("X9jL2pW8mN4kR7vQ1sT5bY3zH6gD0fC9jK2lM8nP4qR7sT5vW1", f"{1}_identity_pri")
-    #     print(f"[*] Success: Identity key for {1} has been deleted.")
-    #     keyring.delete_password("X9jL2pW8mN4kR7vQ1sT5bY3zH6gD0fC9jK2lM8nP4qR7sT5vW1", f"{2}_identity_pri")
-    #     print(f"[*] Success: Identity key for {2} has been deleted.")
-    # except keyring.errors.PasswordDeleteError:
-    #     print("[!] Error: Key not found or already deleted.")
+# if __name__ == "__main__":
+#     # try:
+#     #     # Delete the Identity Key
+#     #     keyring.delete_password("X9jL2pW8mN4kR7vQ1sT5bY3zH6gD0fC9jK2lM8nP4qR7sT5vW1", f"{1}_identity_pri")
+#     #     print(f"[*] Success: Identity key for {1} has been deleted.")
+#     #     keyring.delete_password("X9jL2pW8mN4kR7vQ1sT5bY3zH6gD0fC9jK2lM8nP4qR7sT5vW1", f"{2}_identity_pri")
+#     #     print(f"[*] Success: Identity key for {2} has been deleted.")
+#     # except keyring.errors.PasswordDeleteError:
+#     #     print("[!] Error: Key not found or already deleted.")
 
-    alice = CryptoHandler(1)
-    bob = CryptoHandler(2)
+#     alice = CryptoHandler(1)
+#     bob = CryptoHandler(2)
 
-    bob_bundle = bob.get_bundle()
-    bob_otpk_pri = x25519_key.x25519_private_key_generation()
-    bob_otpk_pub_bytes = x25519_key.x25519_public_key_serialization(x25519_key.x25519_public_key_generation(bob_otpk_pri))
+#     bob_bundle = bob.get_bundle()
+#     bob_otpk_pri = x25519_key.x25519_private_key_generation()
+#     bob_otpk_pub_bytes = x25519_key.x25519_public_key_serialization(x25519_key.x25519_public_key_generation(bob_otpk_pri))
 
-    alice_session, alice_ek_bytes = alice.initiate_session(bob_bundle, bob_otpk_pub_bytes)
-    alice_ik_bytes = x25519_key.x25519_public_key_serialization(alice.ik_pub)
+#     alice_session, alice_ek_bytes = alice.initiate_session(bob_bundle, bob_otpk_pub_bytes)
+#     alice_ik_bytes = x25519_key.x25519_public_key_serialization(alice.ik_pub)
     
-    bob_session = bob.receive_session(alice_ik_bytes, alice_ek_bytes, bob_otpk_pri)
+#     bob_session = bob.receive_session(alice_ik_bytes, alice_ek_bytes, bob_otpk_pri)
 
-    # Encrypt
-    msg = "kkkkkk看看看看嗎？"
-    c_blob, c_ad = alice_session.encrypt_message(msg)
-    print(f"Encrypted: {c_blob}")
+#     # Encrypt
+#     msg = "kkkkkk看看看看嗎？"
+#     c_blob, c_ad = alice_session.encrypt_message(msg)
+#     print(f"Encrypted: {c_blob}")
 
-    # Decrypt
-    p_text = bob_session.decrypt_message(c_blob, c_ad)
-    print(f"Decrypted: {p_text.decode()}")
+#     # Decrypt
+#     p_text = bob_session.decrypt_message(c_blob, c_ad)
+#     print(f"Decrypted: {p_text.decode()}")
