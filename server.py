@@ -442,20 +442,20 @@ def get_bundle(username):
     # 1. Fetch the long-term keys
     bundle = PreKeyBundle.query.get(username)
     # 2. Fetch ONE one-time pre-key
-    opk = OneTimePreKey.query.filter_by(username=username).first()
+    otpk = OneTimePreKey.query.filter_by(username=username).first()
     
     # 3. If OPK exists, return it and then DELETE it from DB
-    opk_data = None
-    if opk:
-        opk_data = opk.key_data
-        db.session.delete(opk)
+    otpk_data = None
+    if otpk:
+        otpk_data = otpk.key_data
+        db.session.delete(otpk)
         db.session.commit()
 
     return jsonify({
         "ik": bundle.identity_key,
         "spk": bundle.signed_pre_key,
         "sig": bundle.signature,
-        "opk": opk_data
+        "otpk": otpk_data
     })
 
 
